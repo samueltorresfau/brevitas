@@ -68,10 +68,14 @@ class GateParams(QuantBiasMixin, nn.Module):
             input_weight,
             dtype,
             device,
+            two_bias=False,
             **kwargs):
         nn.Module.__init__(self)
-        if bias:
+        if bias and not two_bias:
             self.bias = nn.Parameter(torch.randn(hidden_size, dtype=dtype, device=device))
+        elif bias:
+            self.bias = nn.Parameter(torch.zeros(hidden_size, dtype=dtype, device=device)) # input bias!
+            self.hidden_bias = nn.Parameter(torch.zeros(hidden_size, dtype=dtype, device=device))
         else:
             self.bias = None
         QuantBiasMixin.__init__(self, bias_quant, **kwargs)
@@ -1009,3 +1013,354 @@ class QuantLSTM(QuantRecurrentStackBase):
             if self.cat_output_cell_states:
                 output_cell_states = output_cell_states[0]
         return out, (output_hidden_states, output_cell_states)
+
+
+class _QuantGRUCell(nn.Module):
+    """
+    Quantised analogue of torch.nn.GRUCell, implemented in the same style as
+    `_QuantRNNCell` / `_QuantLSTMCell` so it can be scripted and ‘fast‑swapped’.
+
+    The public signature matches torch.nn.GRUCell **except** that all tensors
+    are already quantised (`QuantTensor` stripped to `.tensor` before maths).
+    """
+
+    __constants__ = ['reverse_input', 'batch_first']
+
+    def __init__(
+        self,
+        output_quant: nn.Module,
+        reset_acc_quant: nn.Module,
+        update_acc_quant: nn.Module,
+        new_acc_quant: nn.Module,
+        sigmoid_quant: nn.Module,
+        tanh_quant: nn.Module,
+        reverse_input: bool,
+        batch_first: bool,
+        output_quant_enabled: bool,
+        fast_impl: bool,
+    ):
+        super().__init__()
+        self.output_quant = output_quant
+        self.reset_acc_quant = reset_acc_quant
+        self.update_acc_quant = update_acc_quant
+        self.new_acc_quant = new_acc_quant
+        self.sigmoid_quant = sigmoid_quant
+        self.tanh_quant = tanh_quant
+        self.reverse_input = reverse_input
+        self.batch_first = batch_first
+        self.hidden_states_init = _QuantStatesInit(fast_impl, output_quant_enabled)
+
+    # one time‑step ---------------------------------------------------------
+    def forward_iter(
+        self,
+        q_in: Tensor,
+        q_h: Tensor,
+        w_ir: Tensor, w_iz: Tensor, w_in: Tensor,
+        w_hr: Tensor, w_hz: Tensor, w_hn: Tensor,
+        b_ir: Tensor, b_iz: Tensor, b_in: Tensor,
+        b_hr: Tensor, b_hz: Tensor, b_hn: Tensor,
+    ):
+        # ------------------------------------------------------------------ reset
+        r_i = F.linear(q_in, w_ir) + b_ir
+        r_h = F.linear(q_h,  w_hr) + b_hr
+        q_r = self.reset_acc_quant(r_i + r_h)[0]
+        q_r = self.sigmoid_quant(q_r)[0]               # r_t
+
+        # ----------------------------------------------------------------- update
+        z_i = F.linear(q_in, w_iz) + b_iz
+        z_h = F.linear(q_h,  w_hz) + b_hz
+        q_z = self.update_acc_quant(z_i + z_h)[0]
+        q_z = self.sigmoid_quant(q_z)[0]               # z_t
+
+        # ------------------------------------------------------------ new / candidate
+        n_i = F.linear(q_in, w_in) + b_in
+        n_h = F.linear(q_h,  w_hn) + b_hn
+        q_n_pre = n_i + q_r * n_h                      # b_hn is *inside* Hadamard
+        q_n = self.new_acc_quant(q_n_pre)[0]
+        q_n = self.tanh_quant(q_n)[0]                  # ñ_t
+
+        # --------------------------------------------------------------- hidden upd
+        q_h_next = q_z * q_h + (1.0 - q_z) * q_n       # final h_t
+        q_h_tuple = self.output_quant(q_h_next)
+        return q_h_tuple
+
+    # whole sequence --------------------------------------------------------
+    def forward(
+        self,
+        q_in: Tensor,              # (T,B,F) or (B,T,F)
+        q_h0: Tensor,              # (B,H)
+        w_ir: Tensor, w_iz: Tensor, w_in: Tensor,
+        w_hr: Tensor, w_hz: Tensor, w_hn: Tensor,
+        b_ir: Tensor, b_iz: Tensor, b_in: Tensor,
+        b_hr: Tensor, b_hz: Tensor, b_hn: Tensor,
+    ):
+        if self.batch_first:
+            inputs = q_in.unbind(1)
+        else:
+            inputs = q_in.unbind(0)
+
+        idx, step = (len(inputs) - 1, -1) if self.reverse_input else (0, 1)
+        q_h = q_h0
+        q_outputs = self.hidden_states_init()
+
+        for _ in range(len(inputs)):
+            q_h_tuple = self.forward_iter(
+                inputs[idx], q_h,
+                w_ir, w_iz, w_in,
+                w_hr, w_hz, w_hn,
+                b_ir, b_iz, b_in,
+                b_hr, b_hz, b_hn,
+            )
+            idx += step
+            q_outputs += [q_h_tuple]
+            q_h = q_h_tuple[0]        # unwrap QuantTensor → Tensor
+
+        return q_outputs
+# ---------------------------------------------------------------------------
+
+class _QuantGRULayer(QuantRecurrentLayerMixin, nn.Module):
+    """
+    One bidirectional GRU layer (three gates).  Mirrors `_QuantLSTMLayer`.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        bias: bool,
+        batch_first: bool,
+        weight_quant,
+        bias_quant,
+        io_quant,
+        gate_acc_quant,
+        sigmoid_quant,
+        tanh_quant,
+        reverse_input: bool,
+        quantize_output_only: bool,
+        shared_input_hidden_weights: bool,
+        shared_intra_layer_weight_quant: bool,
+        shared_intra_layer_gate_acc_quant: bool,
+        dtype: Optional[torch.dtype],
+        device: Optional[torch.device],
+        return_quant_tensor: bool,
+        input_reset_weight: GateWeight = None,
+        input_update_weight: GateWeight = None,
+        input_new_weight: GateWeight = None,
+        **kwargs,
+    ):
+        nn.Module.__init__(self)
+
+        # ------------------------------------------------------------------
+        #  Quantisers
+        # ------------------------------------------------------------------
+        io_quant = QuantIdentity(io_quant, act_kwargs_prefix='io_', **kwargs)
+
+        # accumulator quantisation for each gate
+        reset_acc_q = QuantIdentity(gate_acc_quant, act_kwargs_prefix='gate_acc_', **kwargs)
+        if shared_intra_layer_gate_acc_quant:
+            update_acc_q = reset_acc_q
+            new_acc_q    = reset_acc_q
+        else:
+            update_acc_q = QuantIdentity(gate_acc_quant, act_kwargs_prefix='gate_acc_', **kwargs)
+            new_acc_q    = QuantIdentity(gate_acc_quant, act_kwargs_prefix='gate_acc_', **kwargs)
+
+        # internal activation quantisers
+        sig_q = QuantSigmoid(sigmoid_quant, act_kwargs_prefix='sigmoid_', **kwargs)
+        tan_q = QuantTanh   (tanh_quant,   act_kwargs_prefix='tanh_',   **kwargs)
+
+        # ------------------------------------------------------------------
+        #  Cell
+        # ------------------------------------------------------------------
+        cell = _QuantGRUCell(
+            output_quant      = io_quant.act_quant,
+            reset_acc_quant   = reset_acc_q.act_quant,
+            update_acc_quant  = update_acc_q.act_quant,
+            new_acc_quant     = new_acc_q.act_quant,
+            sigmoid_quant     = sig_q.act_quant,
+            tanh_quant        = tan_q.act_quant,
+            reverse_input     = reverse_input,
+            batch_first       = batch_first,
+            output_quant_enabled = io_quant.act_quant.is_quant_enabled,
+            fast_impl         = False,
+        )
+
+        QuantRecurrentLayerMixin.__init__(
+            self,
+            cell=cell,
+            io_quant=io_quant.act_quant,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            reverse_input=reverse_input,
+            quantize_output_only=quantize_output_only,
+            shared_input_hidden_weights=shared_input_hidden_weights,
+            return_quant_tensor=return_quant_tensor,
+        )
+
+        # ------------------------------------------------------------------
+        #  Per‑gate parameters
+        # ------------------------------------------------------------------
+        self.reset_gate_params = GateParams(
+            input_size, hidden_size,
+            bias,
+            weight_quant, bias_quant,
+            input_reset_weight,
+            dtype=dtype, device=device, two_bias=True, **kwargs)
+        
+        if shared_intra_layer_weight_quant:
+            # If requested, share weights for all gates
+            weight_quant = self.reset_gate_params.input_weight.weight_quant
+
+        self.update_gate_params = GateParams(
+            input_size, hidden_size,
+            bias,
+            weight_quant, bias_quant,
+            input_update_weight,
+            dtype=dtype, device=device, two_bias=True, **kwargs)
+
+        self.new_gate_params = GateParams(
+            input_size, hidden_size,
+            bias,
+            weight_quant, bias_quant,
+            input_new_weight,
+            dtype=dtype, device=device, two_bias=True, **kwargs)
+
+        if shared_input_hidden_weights:
+            # If requested to share gate weights, copy weights from input to hidden
+            for gate in [self.reset_gate_params, self.update_gate_params, self.new_gate_params]:
+                gate.hidden_weight = gate.input_weight
+
+        self.shared_intra_layer_gate_acc_quant = shared_intra_layer_gate_acc_quant
+        self.reset_parameters() 
+
+    # ----------------------------------------------------------------------
+    #  Sharing helpers
+    # ----------------------------------------------------------------------
+    @property
+    def weights_to_share(self):
+        if self.shared_input_hidden_weights:
+            return {
+                'input_reset_weight' : self.reset_gate_params.input_weight,
+                'input_update_weight': self.update_gate_params.input_weight,
+                'input_new_weight'   : self.new_gate_params.input_weight,
+            }
+        return {}
+
+    @property
+    def quantizers_to_share(self):
+        q = {'io_quant': self.io_quant}
+        if self.shared_intra_layer_gate_acc_quant:
+            q['reset_acc_quant']  = self.cell.reset_acc_quant
+            q['update_acc_quant'] = self.cell.update_acc_quant
+            q['new_acc_quant']    = self.cell.new_acc_quant
+        return q
+
+    @property
+    def fast_cell(self):
+        # Lazy instantiation as done in LSTM/RNN implementations
+        if self._fast_cell is not None:
+            return self._fast_cell
+        self._fast_cell = _QuantGRUCell(
+            output_quant=self._wrap_act_proxy('output_quant'),
+            reset_acc_quant=self._wrap_act_proxy('reset_acc_quant'),
+            update_acc_quant=self._wrap_act_proxy('update_acc_quant'),
+            new_acc_quant=self._wrap_act_proxy('new_acc_quant'),
+            sigmoid_quant=self._wrap_act_proxy('sigmoid_quant'),
+            tanh_quant   =self._wrap_act_proxy('tanh_quant'),
+            reverse_input=self.cell.reverse_input,
+            batch_first  =self.cell.batch_first,
+            output_quant_enabled=self.cell.output_quant.is_quant_enabled,
+            fast_impl=True)
+        if brevitas.config.JIT_ENABLED:
+            self._fast_cell = torch.jit.script(self._fast_cell)
+        return self._fast_cell
+
+    # ----------------------------------------------------------------------
+    #  Forward
+    # ----------------------------------------------------------------------
+    def forward(self, inp, state):
+        q_in = self.maybe_quantize_input(inp)                # QuantTensor | Tensor
+        q_in_val = _unpack_quant_tensor(q_in)
+
+        # --- fetch quantised weights + biases -----------------------------
+        w_ir, w_hr, b_ir, b_hr = self.gate_params_fwd(self.reset_gate_params,  q_in, two_bias=True)
+        w_iz, w_hz, b_iz, b_hz = self.gate_params_fwd(self.update_gate_params, q_in, two_bias=True)
+        w_in, w_hn, b_in, b_hn = self.gate_params_fwd(self.new_gate_params,    q_in, two_bias=True)
+
+        # handle optional biases
+        device = q_in_val.device
+        def _safe_bias(b):
+            return torch.tensor(0., device=device) if b is None else _unpack_quant_tensor(b)
+        b_ir, b_iz, b_in = (_safe_bias(b) for b in (b_ir, b_iz, b_in))
+        b_hr, b_hz, b_hn = (_safe_bias(b) for b in (b_hr, b_hz, b_hn))
+
+        # hidden state -----------------------------------------------------
+        q_h = self.maybe_quantize_state(q_in_val, state, self.cell.output_quant)
+
+        # select cell implementation --------------------------------------
+        cell = self.export_handler if self.export_mode else (
+               self.fast_cell    if self.fast_mode   else self.cell)
+
+        q_out_seq = cell(
+            q_in_val,
+            _unpack_quant_tensor(q_h),
+            _unpack_quant_tensor(w_ir), _unpack_quant_tensor(w_iz), _unpack_quant_tensor(w_in),
+            _unpack_quant_tensor(w_hr), _unpack_quant_tensor(w_hz), _unpack_quant_tensor(w_hn),
+            b_ir, b_iz, b_in,
+            b_hr, b_hz, b_hn)
+
+        q_out = self.pack_quant_outputs(q_out_seq)
+        q_h_n = self.pack_quant_state(q_out_seq[-1], self.cell.output_quant)
+        return q_out, q_h_n
+
+
+class QuantGRU(QuantRecurrentStackBase):
+    """
+    Quantised GRU (multi‑layer, (bi)directional, optional sharings…),
+    that behaves like `torch.nn.GRU`, but every linear / non‑linear
+    operation is Brevitas‑aware and thus tracked in the quantisation graph.
+    """
+
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int                   = 1,
+        bias: Optional[bool]              = True,
+        batch_first: bool                 = False,
+        bidirectional: bool               = False,
+        weight_quant                      = Int8WeightPerTensorFloat,
+        bias_quant                        = Int32Bias,
+        io_quant                          = Int8ActPerTensorFloat,
+        gate_acc_quant                    = Int8ActPerTensorFloat,
+        sigmoid_quant                     = Uint8ActPerTensorFloat,
+        tanh_quant                        = Int8ActPerTensorFloat,
+        shared_input_hidden_weights: bool = False,
+        shared_intra_layer_weight_quant: bool = False,
+        shared_intra_layer_gate_acc_quant: bool = False,
+        return_quant_tensor: bool         = False,
+        dtype: Optional[torch.dtype]      = None,
+        device: Optional[torch.device]    = None,
+        **kwargs,
+    ):
+        super().__init__(
+            layer_impl=_QuantGRULayer,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            bias=bias,
+            batch_first=batch_first,
+            bidirectional=bidirectional,
+            weight_quant=weight_quant,
+            bias_quant=bias_quant,
+            io_quant=io_quant,
+            gate_acc_quant=gate_acc_quant,
+            sigmoid_quant=sigmoid_quant,
+            tanh_quant=tanh_quant,
+            shared_input_hidden_weights=shared_input_hidden_weights,
+            shared_intra_layer_weight_quant=shared_intra_layer_weight_quant,
+            shared_intra_layer_gate_acc_quant=shared_intra_layer_gate_acc_quant,
+            return_quant_tensor=return_quant_tensor,
+            dtype=dtype,
+            device=device,
+            **kwargs,
+        )

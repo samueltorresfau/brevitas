@@ -26,6 +26,7 @@ from .quant_linear import QuantLinear
 from .quant_mha import QuantMultiheadAttention
 from .quant_rnn import QuantLSTM
 from .quant_rnn import QuantRNN
+from .quant_rnn import QuantGRU
 from .quant_scale_bias import QuantScaleBias
 from .quant_scale_bias import ScaleBias
 from .quant_sdpa import QuantScaledDotProductAttention

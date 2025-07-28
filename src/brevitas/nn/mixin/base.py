@@ -158,11 +158,15 @@ class QuantRecurrentLayerMixin(ExportMixin):
         return output_dict
 
     @staticmethod
-    def gate_params_fwd(gate, quant_input):
+    def gate_params_fwd(gate, quant_input, two_bias=False):
         quant_weight_ih = gate.input_weight()
         quant_weight_hh = gate.hidden_weight()
         quant_bias = gate.bias_quant(gate.bias, quant_input, quant_weight_ih)
-        return quant_weight_ih, quant_weight_hh, quant_bias
+        if two_bias and gate.hidden_bias is not None:
+            quant_hidden_bias = gate.bias_quant(gate.hidden_bias, quant_input, quant_weight_ih)
+            return quant_weight_ih, quant_weight_hh, quant_bias, quant_hidden_bias
+        else:
+            return quant_weight_ih, quant_weight_hh, quant_bias
 
     def reset_parameters(self) -> None:
         stdv = 1.0 / math.sqrt(self.hidden_size)
